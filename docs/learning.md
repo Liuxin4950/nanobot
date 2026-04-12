@@ -1,6 +1,6 @@
 # Nanobot 渐进式学习路径
 
-这是一个超详细的项目学习指南，帮助你从浅入深理解 nanobot 如何控制 AI。
+这是一个超详细的项目学习指南，帮助你从浅入深理解 nanobot 的架构。
 
 ---
 
@@ -21,30 +21,46 @@
 ### 1.2 核心文件位置
 
 ```
-nanobot/agent/loop.py     ← 最重要！AI 循环在这里
-nanobot/agent/context.py   ← 提示词怎么构建
-nanobot/providers/        ← 怎么连接各种 AI
-nanobot/agent/tools/      ← AI 能调用什么工具
+nanobot/agent/loop.py      ← 核心编排器（消息分派、会话锁）
+nanobot/agent/runner.py    ← 底层执行引擎（LLM 调用、工具执行）
+nanobot/agent/context.py    ← 提示词构建
+nanobot/agent/memory.py     ← 记忆系统（MemoryStore, Dream, Consolidator）
+nanobot/providers/          ← LLM 提供商
+nanobot/agent/tools/        ← AI 能调用的工具
 ```
 
 ---
 
-## 阶段二：理解 AI 循环（核心）
+## 阶段二：理解 Agent 系统（核心）
 
-### 2.1 主循环流程 (`agent/loop.py`)
+### 2.1 双层架构：AgentLoop + AgentRunner
 
-**核心方法：`_run_agent_loop()`**
+**为什么分成两层？**
+
+- `AgentLoop` 负责编排：消息路由、会话锁、pending 队列、cron、heartbeat
+- `AgentRunner` 负责执行：LLM 调用、工具执行、hooks、checkpoint
+
+```
+AgentLoop._process_message()
+        ↓
+AgentRunner.run() → AsyncIterator[RunnerEvent]
+        ↓
+LLM.chat() + ToolRegistry.execute()
+```
+
+### 2.2 主循环流程 (`agent/loop.py`)
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                     run() → _dispatch()                     │
-│                              ↓                              │
-│              _process_message()                             │
-│                              ↓                              │
-│              build_messages() ← 组装提示词                   │
-│                              ↓                              │
-│                   _run_agent_loop()                         │
-│                              ↓                              │
+│                    run() → _dispatch()                       │
+│                               ↓                              │
+│            _process_message()                               │
+│              ↓ 检查 slash command                           │
+│              ↓ auto_compact.prepare_session()               │
+│              ↓ consolidator.maybe_consolidate_by_tokens()  │
+│              ↓ build_messages() ← 组装提示词                 │
+│              ↓ AgentRunner.run()                            │
+│                               ↓                              │
 │    ┌──────────────────────────────────────────────┐        │
 │    │  for 最多 40 轮:                              │        │
 │    │    1. provider.chat() ← 发送消息给 AI         │        │
@@ -52,60 +68,68 @@ nanobot/agent/tools/      ← AI 能调用什么工具
 │    │       - 如果有 tool_calls → 执行工具 → 循环   │        │
 │    │       - 如果有 content   → 返回答案           │        │
 │    └──────────────────────────────────────────────┘        │
+│              ↓ _save_turn() → SessionManager.save()        │
 └─────────────────────────────────────────────────────────────┘
 ```
 
-### 2.2 关键代码解析
-
-**loop.py 第 177-254 行：主循环**
+### 2.3 AgentRunner 详解 (`agent/runner.py`)
 
 ```python
-async def _run_agent_loop(self, messages: list[dict]) -> LLMResponse:
-    """核心循环：AI 思考 → 工具调用 → 重复"""
-    max_iterations = 40
+@dataclass
+class AgentRunSpec:
+    messages: list[dict]
+    tools: list[dict]
+    provider: LLMProvider
+    hooks: list[AgentHook]
+    max_iterations: int = 40
+    injection_cb: Callable | None = None
 
-    for iteration in range(max_iterations):
-        # 第 1 步：调用 AI
-        response = await self.provider.chat(
-            messages=messages,
-            tools=self.tools.get_definitions(),  # 把工具交给 AI
-        )
+async def run(self, spec: AgentRunSpec) -> AsyncIterator[RunnerEvent]:
+    """Async iterator - 每个事件 yield 出来"""
+    for iteration in range(spec.max_iterations):
+        # 1. before_iteration hooks
+        await self._call_hooks("before_iteration", ctx)
 
-        # 第 2-1 步：AI 要求调用工具
+        # 2. LLM chat
+        response = await spec.provider.chat(spec.messages, tools=spec.tools)
+
+        # 3. on_stream hooks (token by token)
+        if response.thinking_blocks:
+            for block in response.thinking_blocks:
+                yield RunnerEvent("delta", block["text"])
+                await self._call_hooks("on_stream", ctx, delta)
+
+        # 4. tool_calls 执行
         if response.tool_calls:
-            # 执行每个工具
-            for tool_call in response.tool_calls:
-                result = await self.tools.execute(
-                    tool_call.name,
-                    tool_call.arguments
-                )
-                # 把工具结果添加回消息历史
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tool_call.id,
-                    "content": result
-                })
-            # 继续循环，AI 会看到工具结果继续思考
+            for tc in response.tool_calls:
+                result = await self.tools.execute(tc.name, tc.arguments)
+                spec.messages.append({role: "tool", ...})
+                yield RunnerEvent("tool_result", (tc.id, result))
 
-        # 第 2-2 步：AI 直接回答
-        else:
-            return response  # 完成！
+        # 5. after_iteration hooks
+        await self._call_hooks("after_iteration", ctx, response)
+
+class RunnerEvent(NamedTuple):
+    type: str   # "delta", "tool_call", "tool_result", "done", "error"
+    data: Any
 ```
 
-### 2.3 小巧思 1：非流式调用 + 进度回调
-
-**为什么不用流式？**
-- 代码更简单
-- 进度通过 callback 模拟推送
+### 2.4 小巧思 1：per-session 锁 + mid-turn injection
 
 ```python
-# loop.py 第 191 行
-response = await self.provider.chat(...)  # 不是流式！
-
-# 收到 AI 的 thinking_blocks 时，通过 on_progress 推送
-if response.thinking_blocks:
-    for block in response.thinking_blocks:
-        await self._on_progress(block["text"])
+# AgentLoop._dispatch()
+async def _dispatch(self, msg):
+    key = self._effective_session_key(msg)
+    async with self._session_locks[key]:  # 同一会话串行
+        if key in self._pending_queues:
+            # mid-turn: 消息在处理中，新消息排队
+            self._pending_queues[key].put_nowait(msg)
+        else:
+            # 没有 pending，开始处理
+            self._pending_queues[key] = asyncio.Queue()
+            await self._process_message(msg)
+            # 处理完，释放锁
+            del self._session_locks[key]
 ```
 
 ---
@@ -116,31 +140,28 @@ if response.thinking_blocks:
 
 ```
 Tool (抽象基类)
-    ↓
-┌─────────────────────────────────────────┐
-│  ReadFileTool  │  WriteFileTool         │
-│  ExecTool     │  WebSearchTool          │
-│  MessageTool  │  CronTool               │
-└─────────────────────────────────────────┘
-    ↓
-ToolRegistry (统一管理)
+    │
+    ├── Schema (参数验证 + 类型转换)
+    │
+    └── ToolRegistry (统一管理)
+            │
+            ├── 内置工具 (filesystem, shell, web, cron, spawn, ...)
+            └── MCPToolWrapper (包装 MCP 服务器工具)
 ```
 
 ### 3.2 工具基类 (`tools/base.py`)
 
 ```python
 class Tool(ABC):
-    # 必须实现的属性
     @property
     def name(self) -> str: ...        # 工具名，如 "read_file"
 
     @property
-    def description(self) -> str: ...  # 描述，AI 靠它理解用途
+    def description(self) -> str: ... # 描述，AI 靠它理解用途
 
     @property
-    def parameters(self) -> dict: ...  # JSON Schema 参数定义
+    def parameters(self) -> dict: ... # JSON Schema 参数定义
 
-    # 必须实现的方法
     async def execute(self, **kwargs) -> str: ...  # 执行逻辑
 ```
 
@@ -154,7 +175,7 @@ registry.register(ExecTool())
 
 **AI 调用工具时：**
 ```python
-# 1. 转换为 OpenAI 格式
+# 1. 转换为 OpenAI function calling 格式
 definitions = registry.get_definitions()
 # [
 #   {
@@ -171,17 +192,47 @@ definitions = registry.get_definitions()
 result = await registry.execute("read_file", {"path": "/home/user/test.txt"})
 ```
 
-### 3.4 小巧思 2：工具安全防护
-
-**shell.py 的 ExecTool 实现了多层防护：**
+### 3.4 小巧思 2：参数验证 Schema
 
 ```python
+# tools/schema.py
+class Schema:
+    @staticmethod
+    def validate(params: dict, schema: dict) -> list[str]:
+        """验证参数，返回错误列表（空=有效）"""
+        errors = []
+        # 检查必填
+        for required in schema.get("required", []):
+            if required not in params:
+                errors.append(f"{required} 是必填参数")
+        # 检查类型
+        for key, spec in schema["properties"].items():
+            if key in params:
+                expected = spec["type"]
+                actual = type(params[key]).__name__
+                if not isinstance(params[key], ...):  # type check
+                    errors.append(f"{key} 应该是 {expected}")
+        return errors
+
+    @staticmethod
+    def coerce(params: dict, schema: dict) -> dict:
+        """类型转换"""
+        # "20" (str) → 20 (int)
+        # {"path": "/a/b"} → normalize path
+        return params
+```
+
+### 3.5 小巧思 3：ExecTool 安全防护
+
+```python
+# tools/shell.py - ExecTool 实现了多层防护：
+
 # 1. 危险命令黑名单
 deny_patterns = [
     r"\brm\s+-[rf]{1,2}\b",     # 阻止 rm -rf
     r"\bdel\s+/[fq]\b",          # 阻止 del /f
     r"\bformat\b",               # 阻止 format
-    r"\bshutdown\b",             # 阻止关机
+    r"\bshutdown\b",             # 阻止 shutdown
     # ...
 ]
 
@@ -195,27 +246,6 @@ if ".." in command or command.startswith("/"):
 # 4. 工作区限制
 if restrict_to_workspace:
     # 确保命令只在 workspace 目录内执行
-```
-
-### 3.5 小巧思 3：参数验证
-
-```python
-# base.py - validate_params() 方法
-def validate_params(self, params: dict) -> list[str]:
-    """验证参数，返回错误列表（空=有效）"""
-    schema = self.parameters
-    errors = []
-
-    # 检查类型
-    if schema["properties"]["path"]["type"] != type(params["path"]):
-        errors.append(f"path 应该是 {schema['type']}")
-
-    # 检查必填
-    for required in schema.get("required", []):
-        if required not in params:
-            errors.append(f"{required} 是必填参数")
-
-    return errors
 ```
 
 ---
@@ -234,6 +264,7 @@ def validate_params(self, params: dict) -> list[str]:
 │   3. memory.get_memory_context() → 长期记忆                 │
 │   4. skills.get_always_skills() → 必加载技能               │
 │   5. skills.build_skills_summary() → 所有技能列表           │
+│   6. cron_service.build_context() → 定时任务摘要            │
 │                              ↓                              │
 │   用 "\n\n---\n\n" 连接所有部分                                 │
 └─────────────────────────────────────────────────────────────┘
@@ -251,25 +282,6 @@ def build_messages(self, history, current_message, ...):
     ]
 ```
 
-### 4.3 小巧思 4：提示词缓存
-
-```python
-# litellm_provider.py
-def _apply_cache_control(self, messages, tools):
-    """给系统消息加缓存标记"""
-    for msg in messages:
-        if msg["role"] == "system":
-            # 添加 cache_control: {"type": "ephemeral"}
-            msg["content"] = [{
-                "type": "text",
-                "text": content,
-                "cache_control": {"type": "ephemeral"}
-            }]
-    return messages, tools
-```
-
-**缓存效果：** Anthropic/OpenRouter 会缓存系统提示词，省钱又提速！
-
 ---
 
 ## 阶段五：理解 LLM 提供商
@@ -280,16 +292,23 @@ def _apply_cache_control(self, messages, tools):
 ┌─────────────────────────────────────────────┐
 │           LLMProvider (抽象基类)            │
 │   - chat() 发送聊天请求                      │
-│   - get_default_model()                     │
+│   - chat_stream() 流式                      │
+│   - _is_transient_error() 重试判断           │
 └─────────────────────────────────────────────┘
                       ↓
     ┌─────────────────────────────────────┐
-    │ LiteLLMProvider (主要实现)           │
-    │ - 支持 20+ 提供商（OpenAI, Anthropic）│
-    │ - 自动模型前缀处理                    │
-    │ - 支持提示词缓存                       │
+    │ OpenAICompatProvider (OpenAI 兼容)   │
+    │ AnthropicProvider (原生 SDK)         │
+    │ AzureOpenAIProvider                  │
+    │ GitHubCopilotProvider / OpenAICodexProvider │
     └─────────────────────────────────────┘
 ```
+
+**不是所有提供商都用 LiteLLM**：
+- Anthropic 使用官方 `anthropic` SDK
+- GitHub Copilot 和 OpenAI Codex 使用 OAuth
+- Azure OpenAI 有自己的 provider
+- 大多数使用 OpenAI 兼容接口
 
 ### 5.2 添加新提供商的"2 步法则"
 
@@ -300,7 +319,7 @@ ProviderSpec(
     name="myprovider",              # 配置中用的名字
     keywords=("myprovider", "mymodel"),  # 模型名关键词
     env_key="MYPROVIDER_API_KEY",   # 环境变量
-    litellm_prefix="myprovider",   # 自动前缀
+    backend="openai_compat",        # 大多数是 openai_compat
 )
 ```
 
@@ -315,24 +334,24 @@ class ProvidersConfig(BaseModel):
 - ✅ 环境变量自动设置
 - ✅ 模型名自动前缀
 - ✅ `nanobot status` 显示
-- ✅ API Key 前缀检测
 
-### 5.3 小巧思 5：提供商自动检测
+### 5.3 小巧思 4：自动检测 + 重试机制
 
 ```python
-# registry.py - find_gateway() 逻辑
-def find_gateway(api_key: str = None, api_base: str = None):
-    # 1. 通过 API key 前缀检测
-    if api_key and api_key.startswith("sk-or-"):
-        return OpenRouter  # OpenRouter 的 key 以 sk-or- 开头
+# providers/base.py - LLMProvider
 
-    # 2. 通过 API URL 关键词检测
-    if api_base and "openrouter" in api_base:
-        return OpenRouter
+# 重试判断
+def _is_transient_error(self, e) -> bool:
+    """是否是临时性错误（网络、限流等）"""
+    # 429 Rate Limit → True
+    # 500 Server Error → True
+    # 401 Auth Error → False
+    # ...
 
-    # 3. 通过模型名关键词检测
-    if model.startswith("claude"):
-        return Anthropic
+def _extract_retry_after(self, e) -> float | None:
+    """从响应头解析 Retry-After"""
+    # Retry-After: 30
+    # Retry-After: Fri, 31 Dec 2026 23:59:59 GMT
 ```
 
 ---
@@ -343,13 +362,12 @@ def find_gateway(api_key: str = None, api_base: str = None):
 
 ```
 BaseChannel (抽象基类)
-    ↓
-┌──────────────────────────────────────────┐
-│ TelegramChannel  DiscordChannel          │
-│ FeishuChannel    WhatsAppChannel        │
-│ SlackChannel     EmailChannel           │
-│ ...                                     │
-└──────────────────────────────────────────┘
+    │
+    ├── telegram.py, discord.py, feishu.py, whatsapp.py
+    ├── qq.py, weixin.py, dingtalk.py, wecom.py
+    ├── matrix.py, email.py, slack.py
+    ├── websocket.py (WebSocket 服务器)
+    └── mochat.py
 ```
 
 ### 6.2 消息流向
@@ -371,7 +389,7 @@ Channel.send()
     ↓ 发给用户
 ```
 
-### 6.3 小巧思 6：统一的访问控制
+### 6.3 小巧思 5：统一的访问控制
 
 ```python
 # base.py - is_allowed()
@@ -386,107 +404,108 @@ def is_allowed(self, sender_id: str) -> bool:
 
 ---
 
-## 阶段七：理解技能系统
+## 阶段七：理解记忆系统（新）
 
-### 7.1 技能格式 (SKILL.md)
-
-```yaml
----
-name: github
-description: 使用 gh CLI 与 GitHub 交互
-always: false  # 是否默认加载
-metadata:
-  nanobot:
-    requires:
-      bins: ["gh"]      # 需要 gh 命令
-      env: ["GITHUB_TOKEN"]
----
-
-# GitHub Skill
-
-使用 `gh` 命令与 GitHub 交互...
-
-## 可用命令
-- `gh repo list`
-- `gh issue list`
-```
-
-### 7.2 技能加载机制
-
-```python
-# skills.py
-def list_skills(self):
-    # 扫描两个目录
-    # 1. workspace/skills/ （用户自定义）
-    # 2. nanobot/skills/ （内置）
-    return [skill for skill in dirs if skill/SKILL.md.exists()]
-
-def build_skills_summary(self):
-    # 生成 XML 格式的技能列表
-    return """<skills>
-  <skill>
-    <name>github</name>
-    <description>...</description>
-    <location>nanobot/skills/github/SKILL.md</location>
-  </skill>
-</skills>"""
-```
-
-### 7.3 小巧思 7：按需加载
-
-```python
-# context.py - 构建提示词时
-# 1. always=true 的技能 → 自动加载到提示词
-always_skills = skills.get_always_skills()
-if always_skills:
-    parts.append(load_skills_for_context(always_skills))
-
-# 2. 其他技能 → 列出摘要，AI 需要时自己读取
-parts.append(build_skills_summary())
-# AI 会自己用 read_file 工具读取需要的技能
-```
-
----
-
-## 阶段八：理解记忆系统
-
-### 8.1 两层记忆
+### 7.1 三层架构
 
 ```
 ┌─────────────────────────────────────┐
-│         MEMORY.md                   │
-│    长期记忆（重要事实）               │
-│    - 用户偏好                        │
-│    - 关键信息                        │
-│    - 由 LLM 定期更新                  │
-└─────────────────────────────────────┘
-              ↓ 自动整合
-┌─────────────────────────────────────┐
-│         HISTORY.md                  │
-│    对话历史（可搜索）                 │
-│    - 带时间戳的完整对话              │
-│    - 可用 grep 搜索                   │
+│       session.messages              │
+│    (短中期对话，上下文窗口内)         │
+└───────────────┬─────────────────────┘
+                │ maybe_consolidate_by_tokens()
+┌───────────────▼─────────────────────┐
+│      memory/history.jsonl           │
+│  (append-only, cursor-based)        │
+└───────────────┬─────────────────────┘
+                │ Dream (cron, 默认 2h)
+┌───────────────▼─────────────────────┐
+│  SOUL.md / USER.md / MEMORY.md      │
+│  (GitStore 版本化)                   │
 └─────────────────────────────────────┘
 ```
 
-### 8.2 记忆整合触发
+### 7.2 Dream 两阶段
 
+**Phase 1**: LLM 总结历史
 ```python
-# memory.py
-async def maybe_consolidate(self, messages: list):
-    if len(messages) > self.window_size:
-        # 调用 LLM 来提取重要事实
-        await self._consolidate_with_llm(messages)
+# memory.py - Dream
+async def phase1_summarize(self, unconsolidated) -> str:
+    """用 LLM 总结未整合的消息"""
+    prompt = f"总结以下对话的关键信息：\n{unconsolidated}"
+    return await self.provider.chat([{"role": "user", "content": prompt}])
 ```
 
-### 8.3 小巧思 8：自动记忆更新
+**Phase 2**: LLM 更新记忆文件
+```python
+# Phase 2: LLM 用工具更新 SOUL.md / USER.md / MEMORY.md
+# 工具: save_memory(path, content)
+# 受 max_iterations 预算限制
+```
+
+### 7.3 GitStore 版本化
 
 ```python
-# 整合时，LLM 收到指令：
-"""
-分析以下对话历史，提取需要长期记住的重要信息。
-如果需要更新 MEMORY.md，调用 save_memory 工具。
-"""
+class GitStore:
+    """记忆文件的 Git 版本化"""
+    def save(self, path, content, sha=None) -> str:
+        """保存并 commit"""
+        # 写入文件 → git add → git commit
+        # 返回新的 commit SHA
+
+    def restore(self, sha) -> list[str]:
+        """恢复到指定版本"""
+        # git show SHA:path → 返回文件内容列表
+```
+
+### 7.4 小巧思 6：AutoCompact 主动压缩
+
+```python
+# autocompact.py
+class AutoCompact:
+    """会话空闲超过 session_ttl_minutes 时压缩"""
+    def prepare_session(self, session) -> bool:
+        """返回 True 表示已压缩，下次需要注入摘要"""
+        if session.idle_time > self.session_ttl_minutes:
+            # 1. 调用 Dream 压缩历史到 history.jsonl
+            # 2. 保留最近几条消息
+            # 3. 返回 True 表示需要注入摘要
+            return True
+```
+
+---
+
+## 阶段八：理解 Cron 系统
+
+### 8.1 三种调度类型
+
+```python
+@dataclass
+class CronSchedule:
+    type: Literal["at", "every", "cron"]
+    # at: 一次性 timestamp (ms)
+    # every: 固定间隔 (ms)
+    # cron: cron 表达式 + 可选时区
+```
+
+### 8.2 CronService
+
+```python
+class CronService:
+    def __init__(self, store_path, on_job):
+        self.store = CronStore(store_path)  # 持久化
+        self._arm_timer()  # 设置下一个闹钟
+
+    async def _on_timer(self):
+        """timer 触发，运行所有到期任务"""
+        due = self.store.get_due_jobs()
+        await asyncio.gather(*[self._execute_job(j) for j in due])
+        self._arm_timer()
+
+    def _execute_job(self, job):
+        """执行 job，调用 on_job callback"""
+        # on_job → AgentLoop.process_direct()
+        # 结果通过 bus.outbound → Channel → 用户
 ```
 
 ---
@@ -495,23 +514,23 @@ async def maybe_consolidate(self, messages: list):
 
 ```
 第 1 天：
-  1. 阅读 loop.py（理解 AI 循环）
-  2. 阅读 tools/base.py + registry.py（理解工具系统）
-  3. 试着加一个新工具
+  1. 阅读 agent/loop.py（理解 AgentLoop 编排器）
+  2. 阅读 agent/runner.py（理解 AgentRunner 执行引擎）
+  3. 阅读 tools/base.py + tools/registry.py（理解工具系统）
 
 第 2 天：
-  4. 阅读 context.py（理解提示词构建）
-  5. 阅读 providers/registry.py（理解提供商系统）
+  4. 阅读 agent/context.py（理解提示词构建）
+  5. 阅读 providers/base.py + providers/registry.py（理解提供商系统）
   6. 试着加一个新提供商
 
 第 3 天：
-  7. 阅读 channels/base.py + manager.py（理解消息通道）
-  8. 阅读 skills.py（理解技能系统）
+  7. 阅读 channels/base.py + channels/manager.py（理解消息通道）
+  8. 阅读 agent/skills.py（理解技能系统）
   9. 试着加一个新通道
 
 第 4 天：
-  10. 阅读 memory.py（理解记忆系统）
-  11. 阅读一个完整的 channel 实现（如 telegram.py）
+  10. 阅读 agent/memory.py（理解 Dream + MemoryStore）
+  11. 阅读 cron/service.py（理解定时任务）
   12. 深入理解整体架构
 ```
 
@@ -521,30 +540,35 @@ async def maybe_consolidate(self, messages: list):
 
 | 文件 | 行数 | 核心功能 |
 |------|------|----------|
-| `agent/loop.py` | 500+ | AI 循环、工具调用 |
-| `agent/context.py` | 200+ | 提示词构建 |
+| `agent/loop.py` | 640+ | AgentLoop 编排器 |
+| `agent/runner.py` | 817 | AgentRunner 执行引擎 |
+| `agent/context.py` | 110+ | 提示词构建 |
+| `agent/memory.py` | 770 | MemoryStore, Dream, Consolidator |
 | `agent/tools/base.py` | 100+ | 工具基类 |
 | `agent/tools/registry.py` | 60+ | 工具注册执行 |
-| `providers/base.py` | 120+ | Provider 接口 |
-| `providers/litellm_provider.py` | 300+ | 主 Provider 实现 |
-| `providers/registry.py` | 450+ | 提供商注册表 |
+| `agent/tools/filesystem.py` | 633 | 文件系统工具 |
+| `providers/base.py` | 470 | LLMProvider 接口 |
+| `providers/registry.py` | ~300 | 提供商注册表 |
 | `channels/base.py` | 130+ | Channel 基类 |
 | `channels/manager.py` | 250+ | 通道管理 |
-| `agent/skills.py` | 220+ | 技能加载 |
-| `agent/memory.py` | 180+ | 记忆系统 |
+| `cron/service.py` | 246+ | CronService |
+| `config/schema.py` | ~400 | Pydantic 配置模型 |
 
 ---
 
 ## 常见问题
 
-**Q: 为什么不使用流式？**
-A: 非流式代码更简单，进度通过 callback 模拟。思想链（thinking）会推送。
+**Q: AgentLoop 和 AgentRunner 有什么区别？**
+A: AgentLoop 是编排器（路由、会话锁、pending 队列）；AgentRunner 是执行引擎（LLM 调用、工具执行、hooks）。
 
 **Q: 如何添加新工具？**
 A: 继承 Tool 类，实现 name/description/parameters/execute 即可。
 
 **Q: 如何添加新通道？**
-A: 继承 BaseChannel，实现 start/stop/send，导入到 manager.py。
+A: 继承 BaseChannel，实现 start/stop/send，注册到 manager。
+
+**Q: Dream 和 Consolidator 有什么区别？**
+A: Consolidator 在 token 超过阈值时触发（Phase1 总结到 history.jsonl）；Dream 是 cron 周期性运行（Phase2 从 history.jsonl 更新到长期记忆文件）。
 
 **Q: 技能和工具的区别？**
-A: 工具是 AI 可以调用的函数；技能是 AI 可以读取的文档（SKILL.md）。
+A: 工具是 AI 可以调用的函数；技能是 AI 可以读取的文档（SKILL.md），提供领域知识。

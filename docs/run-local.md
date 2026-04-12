@@ -5,35 +5,39 @@
 - Python 3.11+
 - Windows/macOS/Linux
 
+## 安装
+
+### 1. 克隆并安装
+
+```bash
+git clone https://github.com/HKUDS/nanobot.git
+cd nanobot
+pip install -e .
+```
+
+### 2. 可选依赖
+
+```bash
+# Matrix 支持
+pip install -e ".[matrix]"
+
+# WeCom 支持
+pip install -e ".[wecom]"
+
+# Weixin 支持
+pip install -e ".[weixin]"
+
+# 开发依赖 (pytest, ruff)
+pip install -e ".[dev]"
+```
+
 ## 当前环境状态
 
 | 检查项 | 状态 |
 |--------|------|
-| Python 版本 | ✅ 3.11.0 (满足 >=3.11) |
-| 核心依赖 | ✅ 已安装 (typer, pydantic, rich, httpx 等) |
+| Python 版本 | ✅ 3.11+ |
+| 核心依赖 | ✅ 已安装 |
 | nanobot 模块 | ✅ 可导入 |
-
-## 安装缺失依赖
-
-nanobot 需要以下依赖，如果运行时提示缺少模块，执行：
-
-```bash
-pip install prompt-toolkit litellm loguru croniter json-repair oauth-cli-kit
-```
-
-完整依赖列表（从 pyproject.toml）：
-
-```bash
-# 核心依赖
-pip install typer litellm pydantic pydantic-settings websockets websocket-client \
-    httpx oauth-cli-kit loguru readability-lxml rich croniter dingtalk-stream \
-    python-telegram-bot lark-oapi socksio python-socketio msgpack slack-sdk \
-    slackify-markdown qq-botpy python-socks prompt-toolkit mcp json-repair
-
-# 可选依赖
-pip install -e ".[matrix]"  # Matrix 支持
-pip install -e ".[dev]"    # 开发依赖 (pytest, ruff)
-```
 
 ## Windows 编码问题
 
@@ -77,15 +81,18 @@ python -m nanobot --help
 
 | 命令 | 说明 |
 |------|------|
-| `python -m nanobot onboard` | 初始化配置和工作区 |
-| `python -m nanobot status` | 查看状态 |
-| `python -m nanobot agent -m "你好"` | 单条消息聊天 |
-| `python -m nanobot agent` | 交互式聊天 |
-| `python -m nanobot gateway` | 启动网关 |
+| `nanobot onboard` | 初始化配置和工作区 |
+| `nanobot status` | 查看状态 |
+| `nanobot agent -m "你好"` | 单条消息聊天 |
+| `nanobot agent` | 交互式聊天 |
+| `nanobot gateway` | 启动网关（连接所有启用的频道）|
+| `nanobot channels login <channel>` | 频道登录（如 WhatsApp 扫码）|
+| `nanobot channels status` | 显示频道状态 |
+| `nanobot cron add/list/remove` | 管理定时任务 |
 
 ## 配置
 
-1. 首次运行 `python -m nanobot onboard` 初始化
+1. 首次运行 `nanobot onboard` 初始化
 2. 编辑 `~/.nanobot/config.json` 添加 API Key
 3. 推荐使用 OpenRouter（免费 API），示例配置：
 
@@ -104,12 +111,40 @@ python -m nanobot --help
 }
 ```
 
+### 使用上游仓库（HKUDS/nanobot）
+
+如果你是从 fork 开发的，需要设置上游仓库：
+
+```bash
+git remote add upstream https://github.com/HKUDS/nanobot.git
+git fetch upstream
+git merge upstream/main
+```
+
+更新代码后重新安装：
+```bash
+pip install -e .
+```
+
 ## 测试
 
 ```bash
 # 测试 CLI 是否正常工作
-python -m nanobot --help
+nanobot --help
 
 # 查看状态
-python -m nanobot status
+nanobot status
+
+# 运行测试
+pytest
+```
+
+## Lint 和格式化
+
+```bash
+# Lint
+ruff check .
+
+# 格式化
+ruff format .
 ```
